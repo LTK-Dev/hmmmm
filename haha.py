@@ -275,23 +275,17 @@ class AgentManager:
             'general_consultant': self.general_consultant
         }
     
-    @st.cache_resource
-    def _get_embedder(_self):
+    def _get_embedder(self):
         """Tải và cache mô hình embedding."""
-        return SentenceTransformerEmbeddings(
-            model_name=EMBEDDER_MODEL,
-            model_kwargs={'device': 'cpu'}
-        )
+        return get_embedder()
     
-    @st.cache_resource
-    def _load_product_store(_self):
+    def _load_product_store(self):
         """Load product FAISS store"""
-        return load_or_create_product_faiss(_self.embedder)
+        return load_or_create_product_faiss(self.embedder)
     
-    @st.cache_resource
-    def _load_script_store(_self):
+    def _load_script_store(self):
         """Load script FAISS store"""
-        return load_or_create_script_faiss(_self.embedder)
+        return load_or_create_script_faiss(self.embedder)
     
     def process_query(self, query: str) -> Dict[str, Any]:
         """Xử lý query thông qua agent routing"""
@@ -309,14 +303,17 @@ class AgentManager:
             'request': request
         }
 
-# --- FAISS Loading Functions (giữ nguyên từ version cũ) ---
+# --- FAISS Loading Functions (fixed caching issues) ---
 @st.cache_resource
-def load_or_create_product_faiss(embedder):
+def load_or_create_product_faiss(_embedder):
     """Tải hoặc tạo FAISS index cho dữ liệu sản phẩm."""
     if os.path.exists(PRODUCT_FAISS_PATH):
-        return FAISS.load_local(PRODUCT_FAISS_PATH, embedder, allow_dangerous_deserialization=True)
+        print(f"INFO: Đang tải chỉ mục sản phẩm từ '{PRODUCT_FAISS_PATH}'...")
+        return FAISS.load_local(PRODUCT_FAISS_PATH, _embedder, allow_dangerous_deserialization=True)
 
     st.info("Đang tạo chỉ mục sản phẩm...")
+    print("INFO: Bắt đầu tạo chỉ mục FAISS cho sản phẩm...")
+    
     try:
         df = pd.read_csv(PRODUCT_CSV_FILE, encoding='utf-8')
         df.columns = [col.strip() for col in df.columns]
@@ -334,20 +331,34 @@ def load_or_create_product_faiss(embedder):
                     chunk_content = f"Sản phẩm: {product_name}\nThông tin về '{field}': {row[field]}"
                     documents.append(chunk_content)
 
-        vectorstore = FAISS.from_texts(texts=documents, embedding=embedder)
+        if not documents:
+            st.error("Lỗi: Không thể tạo được chunks từ file sản phẩm.")
+            st.stop()
+        
+        print(f"INFO: Đã tạo được {len(documents)} chunks sản phẩm.")
+        vectorstore = FAISS.from_texts(texts=documents, embedding=_embedder)
         vectorstore.save_local(PRODUCT_FAISS_PATH)
+        print(f"INFO: Lưu chỉ mục sản phẩm thành công.")
+        st.success("Tạo chỉ mục sản phẩm thành công!")
         return vectorstore
+        
+    except FileNotFoundError:
+        st.error(f"Lỗi: Không tìm thấy file '{PRODUCT_CSV_FILE}'.")
+        st.stop()
     except Exception as e:
         st.error(f"Lỗi khi tạo chỉ mục sản phẩm: {e}")
         st.stop()
 
 @st.cache_resource
-def load_or_create_script_faiss(embedder):
+def load_or_create_script_faiss(_embedder):
     """Tải hoặc tạo FAISS index cho kịch bản Q&A."""
     if os.path.exists(SCRIPT_FAISS_PATH):
-        return FAISS.load_local(SCRIPT_FAISS_PATH, embedder, allow_dangerous_deserialization=True)
+        print(f"INFO: Đang tải chỉ mục kịch bản từ '{SCRIPT_FAISS_PATH}'...")
+        return FAISS.load_local(SCRIPT_FAISS_PATH, _embedder, allow_dangerous_deserialization=True)
 
     st.info("Đang tạo chỉ mục kịch bản...")
+    print("INFO: Bắt đầu tạo chỉ mục FAISS cho kịch bản...")
+
     try:
         df = pd.read_csv(SCRIPT_CSV_FILE, encoding='utf-8')
         documents = [
@@ -355,9 +366,20 @@ def load_or_create_script_faiss(embedder):
             for _, row in df.iterrows() if pd.notna(row['Câu hỏi']) or pd.notna(row['Trả lời'])
         ]
         
-        vectorstore = FAISS.from_texts(texts=documents, embedding=embedder)
+        if not documents:
+            st.error("Lỗi: Không tìm thấy dữ liệu hợp lệ trong file kịch bản.")
+            st.stop()
+        
+        print(f"INFO: Đã tạo được {len(documents)} documents kịch bản.")
+        vectorstore = FAISS.from_texts(texts=documents, embedding=_embedder)
         vectorstore.save_local(SCRIPT_FAISS_PATH)
+        print(f"INFO: Lưu chỉ mục kịch bản thành công.")
+        st.success("Tạo chỉ mục kịch bản thành công!")
         return vectorstore
+        
+    except FileNotFoundError:
+        st.error(f"Lỗi: Không tìm thấy file '{SCRIPT_CSV_FILE}'.")
+        st.stop()
     except Exception as e:
         st.error(f"Lỗi khi tạo chỉ mục kịch bản: {e}")
         st.stop()
