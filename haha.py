@@ -74,46 +74,50 @@ class BaseAgent:
 # --- Router Agent ---
 # --- Router Agent (PHIÊN BẢN NÂNG CẤP) ---
 # --- Router Agent (PHIÊN BẢN TỔNG QUÁT) ---
+# --- Router Agent (PHIÊN BẢN CHỐNG LỖI FORMAT) ---
 class RouterAgent(BaseAgent):
     def __init__(self, model: genai.GenerativeModel):
         super().__init__(AgentType.ROUTER, model)
-        # PROMPT MỚI, HOÀN TOÀN TỔNG QUÁT
+        # PROMPT SIÊU CHẶT CHẼ ĐỂ ĐẢM BẢO CHỈ TRẢ VỀ JSON
         self.routing_prompt = """
-        Bạn là một AI Router thông minh, nhiệm vụ của bạn là phân loại câu hỏi của người dùng để chuyển đến Agent xử lý phù hợp nhất.
+        Bạn là một API phân loại, không phải là một trợ lý trò chuyện.
+        Nhiệm vụ DUY NHẤT của bạn là nhận đầu vào và trả về một đối tượng JSON.
 
-        **# Định nghĩa các Agent:**
-        1.  **product_specialist**: Trả lời các câu hỏi chi tiết về **một sản phẩm cụ thể** (thành phần, cách dùng, công dụng...).
-        2.  **general_consultant**: Trả lời các câu hỏi **tổng quát**, **so sánh**, hoặc **tư vấn theo tình huống** (da dầu nên dùng gì, so sánh 2 sản phẩm, chính sách công ty...).
+        **QUY TẮC BẮT BUỘC:**
+        1.  **CHỈ** trả lời bằng một đối tượng JSON hợp lệ.
+        2.  Câu trả lời của bạn **PHẢI** bắt đầu bằng dấu `{` và kết thúc bằng dấu `}`.
+        3.  **KHÔNG** được thêm bất kỳ văn bản nào trước hoặc sau đối tượng JSON.
+        4.  **KHÔNG** được giải thích.
+        5.  **KHÔNG** được sử dụng markdown (ví dụ: ```json).
 
-        **# Gợi ý từ hệ thống (Dựa trên việc tìm kiếm sơ bộ trong DB sản phẩm):**
-        {hint}
+        **LOGIC PHÂN LOẠI:**
+        - Bạn sẽ nhận được một "Câu hỏi" và một "Gợi ý".
+        - **Ưu tiên cao nhất cho "Gợi ý"**:
+            - Nếu Gợi ý chứa "product_specialist", hãy chọn `product_specialist`.
+            - Nếu Gợi ý chứa "general_consultant", hãy chọn `general_consultant`.
+        - Nếu câu hỏi yêu cầu "so sánh" hoặc hỏi về "chính sách", hãy chọn `general_consultant`.
 
-        **# Nhiệm vụ:**
-        Dựa vào **Câu hỏi cần phân tích** và **ưu tiên cao nhất cho Gợi ý từ hệ thống**, hãy quyết định Agent nào phù hợp.
+        **ĐẦU VÀO:**
+        - Gợi ý: "{hint}"
+        - Câu hỏi: "{query}"
 
-        **Ví dụ về cách bạn nên suy luận:**
-        - Nếu Gợi ý nói rằng "Dữ liệu sản phẩm có chứa thông tin liên quan", bạn nên gần như chắc chắn chọn `product_specialist`.
-        - Nếu Gợi ý nói rằng "Không tìm thấy sản phẩm cụ thể", bạn nên gần như chắc chắn chọn `general_consultant`.
-        - Nếu câu hỏi rõ ràng là về so sánh ("sản phẩm A và sản phẩm B") hoặc chính sách ("đổi trả"), hãy chọn `general_consultant` bất kể gợi ý là gì.
-
-        **Câu hỏi cần phân tích:**
-        "{query}"
-
-        **Yêu cầu:**
-        Trả lời **CHÍNH XÁC** theo định dạng JSON sau. **KHÔNG** thêm bất kỳ văn bản nào khác.
+        **ĐẦU RA (CHỈ JSON):**
+        ```json
         {{
             "agent": "product_specialist" hoặc "general_consultant",
-            "confidence": số từ 0.0 đến 1.0,
-            "reasoning": "lý do ngắn gọn cho quyết định, có nhắc đến gợi ý của hệ thống"
+            "confidence": 1.0,
+            "reasoning": "Lý do ngắn gọn dựa trên Gợi ý và Câu hỏi."
         }}
+        ```
         """
 
-    def process(self, request: TaskRequest, hint: str) -> Dict[str, Any]: # <-- Nhận thêm "hint"
+    def process(self, request: TaskRequest, hint: str) -> Dict[str, Any]:
         """Phân tích và route câu hỏi, có sử dụng hint từ pre-check."""
         try:
-            # Truyền cả query và hint vào prompt
             prompt = self.routing_prompt.format(query=request.query, hint=hint)
             response = self.model.generate_content(prompt)
+
+            # Code vẫn giữ lại bước clean để phòng trường hợp hy hữu
             cleaned_text = response.text.strip().replace("```json", "").replace("```", "")
             routing_decision = json.loads(cleaned_text)
 
@@ -122,13 +126,16 @@ class RouterAgent(BaseAgent):
                 'confidence': routing_decision.get('confidence', 0.5),
                 'reasoning': routing_decision.get('reasoning', 'Phân tích tự động')
             }
-        except Exception as e:
-            st.error(f"Lỗi Router Agent: {e}")
-            # Fallback nếu có lỗi, nhưng giờ ít khả năng xảy ra hơn
+        except (json.JSONDecodeError, AttributeError) as e:
+            st.warning(f"Router Agent trả về format không đúng, sử dụng fallback logic. Lỗi: {e}")
+            # Fallback logic được giữ lại như một lớp bảo vệ cuối cùng
             if "product_specialist" in hint:
                  return {'target_agent': 'product_specialist', 'confidence': 0.7, 'reasoning': 'Fallback dựa trên hint'}
             else:
                  return {'target_agent': 'general_consultant', 'confidence': 0.7, 'reasoning': 'Fallback dựa trên hint'}
+        except Exception as e:
+            st.error(f"Lỗi nghiêm trọng tại Router Agent: {e}")
+            return {'target_agent': 'general_consultant', 'confidence': 0.5, 'reasoning': 'Fallback do lỗi hệ thống'}
 
 # --- Product Specialist Agent ---
 class ProductSpecialistAgent(BaseAgent):
