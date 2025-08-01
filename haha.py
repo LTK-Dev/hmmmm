@@ -12,6 +12,16 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 
+# --- 1. TỐI ƯU HIỆU NĂNG VỚI CACHING ---
+@st.cache_resource
+def get_embedder():
+    """Tải và cache mô hình embedding."""
+    print("INFO: Đang tải mô hình embedding...")
+    return SentenceTransformerEmbeddings(
+        model_name=EMBEDDER_MODEL,
+        model_kwargs={'device': 'cpu'}
+    )
+
 # --- Data Classes và Enums ---
 class AgentType(Enum):
     ROUTER = "router"
