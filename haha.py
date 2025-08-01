@@ -72,77 +72,63 @@ class BaseAgent:
             yield f"Xin lỗi, {self.name} gặp lỗi khi xử lý yêu cầu."
 
 # --- Router Agent ---
+# --- Router Agent (PHIÊN BẢN NÂNG CẤP) ---
+# --- Router Agent (PHIÊN BẢN TỔNG QUÁT) ---
 class RouterAgent(BaseAgent):
     def __init__(self, model: genai.GenerativeModel):
         super().__init__(AgentType.ROUTER, model)
+        # PROMPT MỚI, HOÀN TOÀN TỔNG QUÁT
         self.routing_prompt = """
-        Bạn là Router Agent của hệ thống EKS AI Assistant. Nhiệm vụ của bạn là phân tích câu hỏi và quyết định agent nào sẽ xử lý.
+        Bạn là một AI Router thông minh, nhiệm vụ của bạn là phân loại câu hỏi của người dùng để chuyển đến Agent xử lý phù hợp nhất.
 
-        **Các Agent có sẵn:**
-        1. **product_specialist**: Chuyên gia sản phẩm - xử lý câu hỏi về:
-           - Thông tin chi tiết sản phẩm (công dụng, thành phần, cách dùng)
-           - Chỉ định, chống chỉ định của sản phẩm
-           - Bảo quản, lưu ý khi sử dụng
-           - Tác dụng phụ, liều lượng
+        **# Định nghĩa các Agent:**
+        1.  **product_specialist**: Trả lời các câu hỏi chi tiết về **một sản phẩm cụ thể** (thành phần, cách dùng, công dụng...).
+        2.  **general_consultant**: Trả lời các câu hỏi **tổng quát**, **so sánh**, hoặc **tư vấn theo tình huống** (da dầu nên dùng gì, so sánh 2 sản phẩm, chính sách công ty...).
 
-        2. **general_consultant**: Tư vấn viên chung - xử lý câu hỏi về:
-           - So sánh nhiều sản phẩm
-           - Thông tin về công ty, thương hiệu
-           - Chính sách, dịch vụ khách hàng
-           - Địa chỉ mua hàng, liên hệ
-           - Câu hỏi tổng quát về ngành mỹ phẩm
+        **# Gợi ý từ hệ thống (Dựa trên việc tìm kiếm sơ bộ trong DB sản phẩm):**
+        {hint}
+
+        **# Nhiệm vụ:**
+        Dựa vào **Câu hỏi cần phân tích** và **ưu tiên cao nhất cho Gợi ý từ hệ thống**, hãy quyết định Agent nào phù hợp.
+
+        **Ví dụ về cách bạn nên suy luận:**
+        - Nếu Gợi ý nói rằng "Dữ liệu sản phẩm có chứa thông tin liên quan", bạn nên gần như chắc chắn chọn `product_specialist`.
+        - Nếu Gợi ý nói rằng "Không tìm thấy sản phẩm cụ thể", bạn nên gần như chắc chắn chọn `general_consultant`.
+        - Nếu câu hỏi rõ ràng là về so sánh ("sản phẩm A và sản phẩm B") hoặc chính sách ("đổi trả"), hãy chọn `general_consultant` bất kể gợi ý là gì.
 
         **Câu hỏi cần phân tích:**
         "{query}"
 
         **Yêu cầu:**
-        Trả lời CHÍNH XÁC theo format JSON sau:
+        Trả lời **CHÍNH XÁC** theo định dạng JSON sau. **KHÔNG** thêm bất kỳ văn bản nào khác.
         {{
             "agent": "product_specialist" hoặc "general_consultant",
             "confidence": số từ 0.0 đến 1.0,
-            "reasoning": "lý do ngắn gọn cho quyết định"
+            "reasoning": "lý do ngắn gọn cho quyết định, có nhắc đến gợi ý của hệ thống"
         }}
-
-        CHỈ trả lời JSON, không thêm text nào khác.
         """
-    
-    def process(self, request: TaskRequest) -> Dict[str, Any]:
-        """Phân tích và route câu hỏi đến agent phù hợp"""
+
+    def process(self, request: TaskRequest, hint: str) -> Dict[str, Any]: # <-- Nhận thêm "hint"
+        """Phân tích và route câu hỏi, có sử dụng hint từ pre-check."""
         try:
-            prompt = self.routing_prompt.format(query=request.query)
+            # Truyền cả query và hint vào prompt
+            prompt = self.routing_prompt.format(query=request.query, hint=hint)
             response = self.model.generate_content(prompt)
-            
-            # Parse JSON response
-            routing_decision = json.loads(response.text.strip())
-            
+            cleaned_text = response.text.strip().replace("```json", "").replace("```", "")
+            routing_decision = json.loads(cleaned_text)
+
             return {
                 'target_agent': routing_decision.get('agent', 'general_consultant'),
                 'confidence': routing_decision.get('confidence', 0.5),
                 'reasoning': routing_decision.get('reasoning', 'Phân tích tự động')
             }
-            
-        except json.JSONDecodeError:
-            # Fallback nếu JSON parsing thất bại
-            st.warning("Router Agent trả về format không đúng, sử dụng fallback logic")
-            return self._fallback_routing(request.query)
         except Exception as e:
             st.error(f"Lỗi Router Agent: {e}")
-            return self._fallback_routing(request.query)
-    
-    def _fallback_routing(self, query: str) -> Dict[str, Any]:
-        """Fallback routing logic nếu AI routing thất bại"""
-        query_lower = query.lower()
-        
-        product_keywords = ['sản phẩm', 'công dụng', 'thành phần', 'cách dùng', 'chỉ định', 'tác dụng']
-        general_keywords = ['so sánh', 'công ty', 'mua ở đâu', 'giá', 'chính sách']
-        
-        product_score = sum(1 for kw in product_keywords if kw in query_lower)
-        general_score = sum(1 for kw in general_keywords if kw in query_lower)
-        
-        if product_score > general_score:
-            return {'target_agent': 'product_specialist', 'confidence': 0.7, 'reasoning': 'Fallback: Phát hiện từ khóa sản phẩm'}
-        else:
-            return {'target_agent': 'general_consultant', 'confidence': 0.7, 'reasoning': 'Fallback: Câu hỏi tổng quát'}
+            # Fallback nếu có lỗi, nhưng giờ ít khả năng xảy ra hơn
+            if "product_specialist" in hint:
+                 return {'target_agent': 'product_specialist', 'confidence': 0.7, 'reasoning': 'Fallback dựa trên hint'}
+            else:
+                 return {'target_agent': 'general_consultant', 'confidence': 0.7, 'reasoning': 'Fallback dựa trên hint'}
 
 # --- Product Specialist Agent ---
 class ProductSpecialistAgent(BaseAgent):
@@ -267,46 +253,59 @@ class GeneralConsultantAgent(BaseAgent):
             st.error(f"Lỗi khi truy xuất thông tin Q&A: {e}")
             return []
 
-# --- Agent Manager ---
+# --- Agent Manager (PHIÊN BẢN TỔNG QUÁT) ---
 class AgentManager:
     def __init__(self):
         self.model = genai.GenerativeModel(GENERATIVE_MODEL)
-        self.embedder = self._get_embedder()
-        self.product_store = self._load_product_store()
-        self.script_store = self._load_script_store()
-        
-        # Khởi tạo các agents
+        self.product_store = load_or_create_product_faiss()
+        self.script_store = load_or_create_script_faiss()
+
         self.router = RouterAgent(self.model)
         self.product_specialist = ProductSpecialistAgent(self.model, self.product_store)
         self.general_consultant = GeneralConsultantAgent(self.model, self.script_store)
-        
+
         self.agents = {
             'product_specialist': self.product_specialist,
             'general_consultant': self.general_consultant
         }
-    
-    def _get_embedder(self):
-        """Tải và cache mô hình embedding."""
-        return get_embedder()
-    
-    def _load_product_store(self):
-        """Load product FAISS store"""
-        return load_or_create_product_faiss(self.embedder)
-    
-    def _load_script_store(self):
-        """Load script FAISS store"""
-        return load_or_create_script_faiss(self.embedder)
-    
-    def process_query(self, query: str) -> Dict[str, Any]:
-        """Xử lý query thông qua agent routing"""
-        # 1. Router quyết định agent
-        request = TaskRequest(query=query)
-        routing_decision = self.router.process(request)
+
+    def _pre_route_check(self, query: str, threshold: float = 0.35) -> str:
+        """
+        Kiểm tra nhanh trong DB sản phẩm để tạo gợi ý cho Router.
+        Sử dụng search_with_score để đánh giá độ liên quan.
+        (Lưu ý: FAISS trả về khoảng cách L2, điểm càng thấp càng tốt)
+        """
+        try:
+            # Tìm 1 tài liệu liên quan nhất và điểm số của nó
+            results = self.product_store.similarity_search_with_score(query, k=1)
+            if results:
+                top_doc, score = results[0]
+                print(f"DEBUG: Pre-route check for '{query}' -> Top result score: {score}") # Để debug
+                if score < threshold:
+                    # Nếu điểm số đủ tốt (đủ gần), đây là câu hỏi về sản phẩm
+                    return "Gợi ý: Dữ liệu sản phẩm có chứa thông tin rất liên quan đến câu hỏi này. Rất có thể đây là câu hỏi cho product_specialist."
+        except Exception as e:
+            print(f"ERROR in _pre_route_check: {e}")
+            # Bỏ qua nếu có lỗi
         
-        # 2. Lấy target agent
+        # Mặc định hoặc nếu không tìm thấy kết quả đủ tốt
+        return "Gợi ý: Không tìm thấy sản phẩm cụ thể nào khớp với câu hỏi. Rất có thể đây là câu hỏi cho general_consultant."
+
+    def process_query(self, query: str) -> Dict[str, Any]:
+        """
+        Xử lý query với bước Pre-routing Check.
+        """
+        # 1. Thực hiện Pre-routing check để tạo gợi ý <-- THAY ĐỔI QUAN TRỌNG
+        hint = self._pre_route_check(query)
+
+        # 2. Router quyết định agent, có sử dụng "gợi ý"
+        request = TaskRequest(query=query)
+        routing_decision = self.router.process(request, hint) # <-- Truyền "hint" vào router
+
+        # 3. Lấy target agent
         target_agent_name = routing_decision['target_agent']
         target_agent = self.agents.get(target_agent_name, self.general_consultant)
-        
+
         return {
             'agent': target_agent,
             'routing_info': routing_decision,
