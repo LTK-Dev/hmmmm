@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 import os
 import google.generativeai as genai
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 import json
+import re
 
 # Import các thư viện cần thiết cho FAISS và LangChain
 from langchain_community.vectorstores import FAISS
@@ -23,17 +24,25 @@ def get_embedder():
     )
 
 # --- Data Classes và Enums ---
-class AgentType(Enum):
-    ROUTER = "router"
-    PRODUCT_SPECIALIST = "product_specialist"
-    GENERAL_CONSULTANT = "general_consultant"
+class SourceType(Enum):
+    SCRIPT = "script"
+    PRODUCT = "product"
+    HYBRID = "hybrid"
 
 @dataclass
-class AgentResponse:
+class RetrievedInfo:
     content: str
-    confidence: float
-    agent_type: AgentType
+    source_type: SourceType
+    score: float
     metadata: Dict[str, Any] = None
+
+@dataclass
+class MasterDecision:
+    primary_source: SourceType
+    confidence: float
+    reasoning: str
+    selected_info: List[RetrievedInfo]
+    response_strategy: str
 
 @dataclass
 class TaskRequest:
@@ -49,275 +58,267 @@ SCRIPT_FAISS_PATH = "faiss_index_script"
 EMBEDDER_MODEL = 'intfloat/multilingual-e5-base'
 GENERATIVE_MODEL = 'gemini-2.0-flash'
 
-# --- Base Agent Class ---
-class BaseAgent:
-    def __init__(self, agent_type: AgentType, model: genai.GenerativeModel):
-        self.agent_type = agent_type
+# --- Master Agent (Thay thế Router) ---
+class MasterAgent:
+    def __init__(self, model: genai.GenerativeModel, product_store: FAISS, script_store: FAISS):
         self.model = model
-        self.name = agent_type.value
-    
-    def process(self, request: TaskRequest) -> AgentResponse:
-        """Base method để xử lý request - sẽ được override bởi các agent con"""
-        raise NotImplementedError("Subclasses must implement process method")
-    
-    def _generate_stream_response(self, prompt: str):
-        """Helper method để generate streaming response"""
+        self.product_store = product_store
+        self.script_store = script_store
+        
+        self.evaluation_prompt = """
+Bạn là Master Agent của hệ thống EKS - có nhiệm vụ đánh giá và quyết định nguồn thông tin tốt nhất để trả lời khách hàng.
+
+**Câu hỏi từ khách hàng:**
+{query}
+
+**THÔNG TIN TỪ KỊCH BẢN Q&A:**
+{script_info}
+
+**THÔNG TIN TỪ DATABASE SẢN PHẨM:**
+{product_info}
+
+**NHIỆM VỤ CỦA BẠN:**
+1. Đánh giá chất lượng và độ phù hợp của mỗi nguồn thông tin
+2. Quyết định nguồn nào nên được ưu tiên
+3. Đưa ra chiến lược trả lời phù hợp
+
+**QUY TẮC ƯU TIÊN:**
+- **KỊCH BẢN Q&A**: Ưu tiên cao nhất nếu có câu trả lời trực tiếp và chính xác
+- **SẢN PHẨM**: Sử dụng khi cần thông tin chi tiết, kỹ thuật về sản phẩm
+- **KẾT HỢP**: Dùng cả hai nguồn khi cần thông tin toàn diện
+
+Trả lời theo format JSON:
+{{
+    "primary_source": "script/product/hybrid",
+    "confidence": 0.9,
+    "reasoning": "Lý do chi tiết về quyết định",
+    "response_strategy": "Chiến lược trả lời cụ thể"
+}}
+"""
+
+        self.response_prompt = """
+Bạn là EKS Master Agent - chuyên gia tư vấn hàng đầu về sản phẩm mỹ phẩm EKS.
+
+**Câu hỏi từ khách hàng:**
+{query}
+
+**THÔNG TIN ĐÃ ĐƯỢC CHỌN:**
+{selected_info}
+
+**CHIẾN LƯỢC TRẢ LỜI:**
+{strategy}
+
+**HƯỚNG DẪN TRẢ LỜI:**
+1. **Xưng hô**: "Tôi là EKS Master Agent"
+2. **Ưu tiên kịch bản**: Nếu có thông tin từ kịch bản Q&A, sử dụng y nguyên
+3. **Bổ sung sản phẩm**: Thêm chi tiết kỹ thuật từ database sản phẩm nếu cần
+4. **Phong cách**: Chuyên nghiệp, thân thiện, dễ hiểu
+5. **Cấu trúc**: Rõ ràng, có logic, dễ theo dõi
+
+**LƯU Ý QUAN TRỌNG:**
+- Luôn dựa trên thông tin có sẵn
+- Thừa nhận nếu không có đủ thông tin
+- Đưa ra lời khuyên thực tế và hữu ích
+- Nếu trong kịch bản Q&A thật sự có câu hỏi có hàm ý và câu trả lời liên quan đến query của khách hàng, hãy sử dụng nguyên câu trả lời đó, đừng ưu tién tư vấn quá nhiều.
+- Chỉ khi mà kịch bản thật sự không có câu trả lời nào liên quan đến query của khách hàng, hãy sử dụng thông tin từ database sản phẩm để tư vấn.
+- Khách hàng ưu tiên câu trả lời ngắn gọn và súc tích, đi vào trọng tâm vấn đề rồi mới diễn giải chi tiết nếu cần thiết.
+"""
+
+    def retrieve_all_sources(self, query: str, k_script: int = 3, k_product: int = 5) -> Tuple[List[RetrievedInfo], List[RetrievedInfo]]:
+        """Truy vấn thông tin từ cả hai vector database."""
+        script_infos = []
+        product_infos = []
+        
+        try:
+            # Truy vấn kịch bản Q&A
+            script_results = self.script_store.similarity_search_with_score(query, k=k_script)
+            for doc, score in script_results:
+                script_infos.append(RetrievedInfo(
+                    content=doc.page_content,
+                    source_type=SourceType.SCRIPT,
+                    score=score,
+                    metadata={'source': 'qa_script'}
+                ))
+            
+            # Truy vấn database sản phẩm
+            product_results = self.product_store.similarity_search_with_score(query, k=k_product)
+            for doc, score in product_results:
+                product_infos.append(RetrievedInfo(
+                    content=doc.page_content,
+                    source_type=SourceType.PRODUCT,
+                    score=score,
+                    metadata={'source': 'product_db'}
+                ))
+                
+        except Exception as e:
+            print(f"ERROR: Lỗi khi truy vấn vector stores: {e}")
+            
+        return script_infos, product_infos
+
+    def evaluate_and_decide(self, query: str, script_infos: List[RetrievedInfo], product_infos: List[RetrievedInfo]) -> MasterDecision:
+        """Đánh giá và quyết định nguồn thông tin tốt nhất."""
+        
+        # Chuẩn bị thông tin cho prompt
+        script_content = "\n\n".join([f"Score: {info.score:.3f}\n{info.content}" for info in script_infos[:3]])
+        product_content = "\n\n".join([f"Score: {info.score:.3f}\n{info.content}" for info in product_infos[:3]])
+        
+        if not script_content:
+            script_content = "Không tìm thấy thông tin liên quan trong kịch bản Q&A"
+        if not product_content:
+            product_content = "Không tìm thấy thông tin liên quan trong database sản phẩm"
+        
+        try:
+            prompt = self.evaluation_prompt.format(
+                query=query,
+                script_info=script_content,
+                product_info=product_content
+            )
+            
+            response = self.model.generate_content(prompt)
+            decision_text = self._extract_json_from_response(response.text)
+            
+            if decision_text:
+                decision_data = json.loads(decision_text)
+                
+                # Chọn thông tin dựa trên quyết định
+                selected_info = self._select_info_based_on_decision(
+                    decision_data.get('primary_source', 'script'),
+                    script_infos,
+                    product_infos
+                )
+                
+                return MasterDecision(
+                    primary_source=SourceType(decision_data.get('primary_source', 'script')),
+                    confidence=decision_data.get('confidence', 0.7),
+                    reasoning=decision_data.get('reasoning', 'Quyết định tự động'),
+                    selected_info=selected_info,
+                    response_strategy=decision_data.get('response_strategy', 'Trả lời dựa trên thông tin có sẵn')
+                )
+                
+        except Exception as e:
+            print(f"WARNING: Lỗi khi đánh giá, sử dụng fallback logic: {e}")
+            
+        # Fallback logic
+        return self._fallback_decision(query, script_infos, product_infos)
+
+    def _extract_json_from_response(self, text: str) -> Optional[str]:
+        """Trích xuất JSON từ response."""
+        try:
+            # Làm sạch text
+            cleaned_text = text.strip()
+            if "```json" in cleaned_text:
+                json_match = re.search(r'```json\s*(\{.*?\})\s*```', cleaned_text, re.DOTALL)
+                if json_match:
+                    return json_match.group(1)
+            
+            # Tìm JSON object
+            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', cleaned_text)
+            if json_match:
+                return json_match.group(0)
+                
+            return None
+        except Exception as e:
+            print(f"WARNING: Lỗi extract JSON: {e}")
+            return None
+
+    def _select_info_based_on_decision(self, primary_source: str, script_infos: List[RetrievedInfo], product_infos: List[RetrievedInfo]) -> List[RetrievedInfo]:
+        """Chọn thông tin dựa trên quyết định của Master Agent."""
+        if primary_source == 'script':
+            return script_infos[:2] + product_infos[:1]  # Ưu tiên script
+        elif primary_source == 'product':
+            return product_infos[:3] + script_infos[:1]  # Ưu tiên product
+        else:  # hybrid
+            return script_infos[:2] + product_infos[:2]  # Cân bằng
+
+    def _fallback_decision(self, query: str, script_infos: List[RetrievedInfo], product_infos: List[RetrievedInfo]) -> MasterDecision:
+        """Logic fallback khi không thể đánh giá được."""
+        
+        # Tính điểm trung bình cho mỗi nguồn
+        script_avg_score = sum(info.score for info in script_infos[:2]) / max(len(script_infos[:2]), 1) if script_infos else 1.0
+        product_avg_score = sum(info.score for info in product_infos[:2]) / max(len(product_infos[:2]), 1) if product_infos else 1.0
+        
+        # FAISS sử dụng L2 distance, score thấp = tốt hơn
+        if script_infos and script_avg_score < 0.4:  # Script có kết quả tốt
+            return MasterDecision(
+                primary_source=SourceType.SCRIPT,
+                confidence=0.7,
+                reasoning="Fallback: Kịch bản Q&A có thông tin phù hợp",
+                selected_info=script_infos[:2] + product_infos[:1],
+                response_strategy="Ưu tiên câu trả lời từ kịch bản, bổ sung thông tin sản phẩm"
+            )
+        elif product_infos and product_avg_score < 0.5:  # Product có kết quả khá tốt
+            return MasterDecision(
+                primary_source=SourceType.PRODUCT,
+                confidence=0.6,
+                reasoning="Fallback: Database sản phẩm có thông tin liên quan",
+                selected_info=product_infos[:3],
+                response_strategy="Tập trung vào thông tin chi tiết sản phẩm"
+            )
+        else:  # Kết hợp cả hai
+            return MasterDecision(
+                primary_source=SourceType.HYBRID,
+                confidence=0.5,
+                reasoning="Fallback: Kết hợp thông tin từ cả hai nguồn",
+                selected_info=script_infos[:1] + product_infos[:2],
+                response_strategy="Kết hợp thông tin từ kịch bản và sản phẩm"
+            )
+
+    def generate_response_stream(self, query: str, decision: MasterDecision):
+        """Generate streaming response dựa trên quyết định của Master Agent."""
+        
+        # Chuẩn bị thông tin đã chọn
+        selected_content = "\n\n".join([
+            f"[{info.source_type.value.upper()}] {info.content}" 
+            for info in decision.selected_info
+        ])
+        
+        prompt = self.response_prompt.format(
+            query=query,
+            selected_info=selected_content,
+            strategy=decision.response_strategy
+        )
+        
         try:
             response_stream = self.model.generate_content(prompt, stream=True)
             for chunk in response_stream:
                 if chunk.text:
                     yield chunk.text
         except Exception as e:
-            st.error(f"Lỗi khi generate response từ {self.name}: {e}")
-            yield f"Xin lỗi, {self.name} gặp lỗi khi xử lý yêu cầu."
+            st.error(f"Lỗi khi generate response: {e}")
+            yield f"Xin lỗi, tôi gặp lỗi khi xử lý yêu cầu của bạn."
 
-# --- Router Agent ---
-class RouterAgent(BaseAgent):
-    def __init__(self, model: genai.GenerativeModel):
-        super().__init__(AgentType.ROUTER, model)
-        # PROMPT SIÊU CHẶT CHẼ ĐỂ ĐẢM BẢO CHỈ TRẢ VỀ JSON
-        self.routing_prompt = """
-        Bạn là một API phân loại, không phải là một trợ lý trò chuyện.
-        Nhiệm vụ DUY NHẤT của bạn là nhận đầu vào và trả về một đối tượng JSON.
-
-        **QUY TẮC BẮT BUỘC:**
-        1.  **CHỈ** trả lời bằng một đối tượng JSON hợp lệ.
-        2.  Câu trả lời của bạn **PHẢI** bắt đầu bằng dấu `{` và kết thúc bằng dấu `}`.
-        3.  **KHÔNG** được thêm bất kỳ văn bản nào trước hoặc sau đối tượng JSON.
-        4.  **KHÔNG** được giải thích.
-        5.  **KHÔNG** được sử dụng markdown (ví dụ: ```json).
-
-        **LOGIC PHÂN LOẠI:**
-        - Bạn sẽ nhận được một "Câu hỏi" và một "Gợi ý".
-        - **Ưu tiên cao nhất cho "Gợi ý"**:
-            - Nếu Gợi ý chứa "product_specialist", hãy chọn `product_specialist`.
-            - Nếu Gợi ý chứa "general_consultant", hãy chọn `general_consultant`.
-        - Nếu câu hỏi yêu cầu "so sánh" hoặc hỏi về "chính sách", hãy chọn `general_consultant`.
-
-        **ĐẦU VÀO:**
-        - Gợi ý: "{hint}"
-        - Câu hỏi: "{query}"
-
-        **ĐẦU RA (CHỈ JSON):**
-        ```json
-        {{
-            "agent": "product_specialist" hoặc "general_consultant",
-            "confidence": 1.0,
-            "reasoning": "Lý do ngắn gọn dựa trên Gợi ý và Câu hỏi."
-        }}
-        ```
-        """
-
-    def process(self, request: TaskRequest, hint: str) -> Dict[str, Any]:
-        """Phân tích và route câu hỏi, có sử dụng hint từ pre-check."""
-        try:
-            prompt = self.routing_prompt.format(query=request.query, hint=hint)
-            response = self.model.generate_content(prompt)
-
-            # Code vẫn giữ lại bước clean để phòng trường hợp hy hữu
-            cleaned_text = response.text.strip().replace("```json", "").replace("```", "")
-            routing_decision = json.loads(cleaned_text)
-            print(f"DEBUG: Router decision: {routing_decision}") 
-
-            return {
-                'target_agent': routing_decision.get('agent', 'general_consultant'),
-                'confidence': routing_decision.get('confidence', 0.5),
-                'reasoning': routing_decision.get('reasoning', 'Phân tích tự động')
-            }
-        except (json.JSONDecodeError, AttributeError) as e:
-            st.warning(f"Router Agent trả về format không đúng, sử dụng fallback logic. Lỗi: {e}")
-            # Fallback logic được giữ lại như một lớp bảo vệ cuối cùng
-            if "product_specialist" in hint:
-                 return {'target_agent': 'product_specialist', 'confidence': 0.7, 'reasoning': 'Fallback dựa trên hint'}
-            else:
-                 return {'target_agent': 'general_consultant', 'confidence': 0.7, 'reasoning': 'Fallback dựa trên hint'}
-        except Exception as e:
-            st.error(f"Lỗi nghiêm trọng tại Router Agent: {e}")
-            return {'target_agent': 'general_consultant', 'confidence': 0.5, 'reasoning': 'Fallback do lỗi hệ thống'}
-
-# --- Product Specialist Agent ---
-class ProductSpecialistAgent(BaseAgent):
-    def __init__(self, model: genai.GenerativeModel, vector_store: FAISS):
-        super().__init__(AgentType.PRODUCT_SPECIALIST, model)
-        self.vector_store = vector_store
-        self.specialist_prompt = """
-        Bạn là Product Specialist Agent của EKS - chuyên gia sâu về các sản phẩm mỹ phẩm. 
-        Bạn có quyền truy cập vào cơ sở dữ liệu chi tiết về tất cả sản phẩm EKS.
-
-        **Thông tin sản phẩm từ database:**
-        ---
-        {context}
-        ---
-
-        **Câu hỏi từ khách hàng:**
-        {query}
-
-        **Chuyên môn của bạn:**
-        - Phân tích thành phần chi tiết
-        - Giải thích cơ chế hoạt động
-        - Hướng dẫn sử dụng chính xác
-        - Cảnh báo chống chỉ định
-        - Tư vấn bảo quản và lưu ý
-
-        **Cách trả lời:**
-        1. **Xưng hô**: "Tôi là chuyên gia sản phẩm EKS"
-        2. **Phong cách**: Chuyên nghiệp, chi tiết, dựa trên khoa học
-        3. **Cấu trúc**: Sử dụng bullet points và headers để dễ đọc
-        4. **Trích dẫn**: Luôn nêu rõ tên sản phẩm cụ thể
-        5. **Độ tin cậy**: Chỉ trả lời dựa trên data có sẵn, thừa nhận nếu không có thông tin
-
-        **Lưu ý quan trọng**: Nếu không tìm thấy thông tin chính xác trong database, 
-        hãy nói rõ "Tôi không tìm thấy thông tin chi tiết về vấn đề này trong cơ sở dữ liệu sản phẩm EKS."
-        """
-    
-    def process(self, request: TaskRequest) -> AgentResponse:
-        # Retrieve relevant product information
-        context = self._get_product_context(request.query)
-        
-        return AgentResponse(
-            content="", # Sẽ được fill bởi streaming
-            confidence=0.9,
-            agent_type=self.agent_type,
-            metadata={'context_size': len(context), 'source': 'product_database'}
-        )
-    
-    def process_stream(self, request: TaskRequest):
-        """Streaming version của process method"""
-        context = self._get_product_context(request.query)
-        prompt = self.specialist_prompt.format(context="\n\n".join(context), query=request.query)
-        
-        yield from self._generate_stream_response(prompt)
-    
-    def _get_product_context(self, query: str, k: int = 5) -> List[str]:
-        """Lấy context từ product vector store"""
-        try:
-            results = self.vector_store.similarity_search(query, k=k)
-            return [doc.page_content for doc in results]
-        except Exception as e:
-            st.error(f"Lỗi khi truy xuất thông tin sản phẩm: {e}")
-            return []
-
-# --- General Consultant Agent ---
-class GeneralConsultantAgent(BaseAgent):
-    def __init__(self, model: genai.GenerativeModel, vector_store: FAISS):
-        super().__init__(AgentType.GENERAL_CONSULTANT, model)
-        self.vector_store = vector_store
-        self.consultant_prompt = """
-        Bạn là General Consultant Agent của EKS - tư vấn viên chuyên về thông tin tổng quát, 
-        so sánh sản phẩm và dịch vụ khách hàng.
-
-        **Thông tin tham khảo từ kịch bản Q&A:**
-        ---
-        {context}
-        ---
-
-        **Câu hỏi từ khách hàng:**
-        {query}
-
-        **Chuyên môn của bạn:**
-        - So sánh và đánh giá sản phẩm
-        - Thông tin về thương hiệu EKS
-        - Chính sách và dịch vụ
-        - Hướng dẫn mua hàng và liên hệ
-        - Tư vấn lựa chọn phù hợp
-
-        **Cách trả lời:**
-        1. **Xưng hô**: "Tôi là tư vấn viên EKS"
-        2. **Phong cách**: Thân thiện, dễ hiểu, tập trung vào giải pháp
-        3. **Ưu tiên**: Nếu có sẵn câu trả lời trong kịch bản, sử dụng y nguyên
-        4. **Linh hoạt**: Có thể tham khảo kiến thức chung nếu cần
-        5. **Hành động**: Đưa ra lời khuyên cụ thể và bước tiếp theo
-
-        **Đặc biệt**: Nếu tìm thấy câu hỏi tương tự trong kịch bản, 
-        hãy sử dụng chính xác câu trả lời đó.
-        """
-    
-    def process(self, request: TaskRequest) -> AgentResponse:
-        context = self._get_general_context(request.query)
-        
-        return AgentResponse(
-            content="", # Sẽ được fill bởi streaming
-            confidence=0.8,
-            agent_type=self.agent_type,
-            metadata={'context_size': len(context), 'source': 'qa_script'}
-        )
-    
-    def process_stream(self, request: TaskRequest):
-        """Streaming version của process method"""
-        context = self._get_general_context(request.query)
-        prompt = self.consultant_prompt.format(context="\n\n".join(context), query=request.query)
-        
-        yield from self._generate_stream_response(prompt)
-    
-    def _get_general_context(self, query: str, k: int = 3) -> List[str]:
-        """Lấy context từ general Q&A vector store"""
-        try:
-            results = self.vector_store.similarity_search(query, k=k)
-            return [doc.page_content for doc in results]
-        except Exception as e:
-            st.error(f"Lỗi khi truy xuất thông tin Q&A: {e}")
-            return []
-
-# --- Agent Manager (PHIÊN BẢN TỔNG QUÁT) ---
+# --- Agent Manager được cập nhật ---
 class AgentManager:
     def __init__(self):
         self.model = genai.GenerativeModel(GENERATIVE_MODEL)
-        self.product_store = load_or_create_product_faiss()
-        self.script_store = load_or_create_script_faiss()
-
-        self.router = RouterAgent(self.model)
-        self.product_specialist = ProductSpecialistAgent(self.model, self.product_store)
-        self.general_consultant = GeneralConsultantAgent(self.model, self.script_store)
-
-        self.agents = {
-            'product_specialist': self.product_specialist,
-            'general_consultant': self.general_consultant
-        }
-
-    def _pre_route_check(self, query: str, threshold: float = 0.35) -> str:
-        """
-        Kiểm tra nhanh trong DB sản phẩm để tạo gợi ý cho Router.
-        Sử dụng search_with_score để đánh giá độ liên quan.
-        (Lưu ý: FAISS trả về khoảng cách L2, điểm càng thấp càng tốt)
-        """
-        try:
-            # Tìm 1 tài liệu liên quan nhất và điểm số của nó
-            results = self.product_store.similarity_search_with_score(query, k=1)
-            if results:
-                top_doc, score = results[0]
-                print(f"DEBUG: Pre-route check for '{query}' -> Top result score: {score}") # Để debug
-                if score < threshold:
-                    # Nếu điểm số đủ tốt (đủ gần), đây là câu hỏi về sản phẩm
-                    return "Gợi ý: Dữ liệu sản phẩm có chứa thông tin rất liên quan đến câu hỏi này. Rất có thể đây là câu hỏi cho product_specialist."
-        except Exception as e:
-            print(f"ERROR in _pre_route_check: {e}")
-            # Bỏ qua nếu có lỗi
+        embedder = get_embedder()
+        self.product_store = load_or_create_product_faiss(embedder)
+        self.script_store = load_or_create_script_faiss(embedder)
         
-        # Mặc định hoặc nếu không tìm thấy kết quả đủ tốt
-        return "Gợi ý: Không tìm thấy sản phẩm cụ thể nào khớp với câu hỏi. Rất có thể đây là câu hỏi cho general_consultant."
+        # Khởi tạo Master Agent thay vì Router
+        self.master_agent = MasterAgent(self.model, self.product_store, self.script_store)
 
     def process_query(self, query: str) -> Dict[str, Any]:
-        """
-        Xử lý query với bước Pre-routing Check.
-        """
-        # 1. Thực hiện Pre-routing check để tạo gợi ý <-- THAY ĐỔI QUAN TRỌNG
-        hint = self._pre_route_check(query)
-
-        # 2. Router quyết định agent, có sử dụng "gợi ý"
-        request = TaskRequest(query=query)
-        routing_decision = self.router.process(request, hint) # <-- Truyền "hint" vào router
-
-        # 3. Lấy target agent
-        target_agent_name = routing_decision['target_agent']
-        target_agent = self.agents.get(target_agent_name, self.general_consultant)
-
+        """Xử lý query với Master Agent."""
+        
+        # 1. Truy vấn tất cả nguồn thông tin
+        script_infos, product_infos = self.master_agent.retrieve_all_sources(query)
+        
+        # 2. Master Agent đánh giá và quyết định
+        decision = self.master_agent.evaluate_and_decide(query, script_infos, product_infos)
+        
         return {
-            'agent': target_agent,
-            'routing_info': routing_decision,
-            'request': request
+            'master_decision': decision,
+            'script_infos': script_infos,
+            'product_infos': product_infos,
+            'query': query
         }
 
-# --- FAISS Loading Functions (fixed caching issues) ---
+    def get_response_stream(self, query: str, decision: MasterDecision):
+        """Lấy streaming response từ Master Agent."""
+        return self.master_agent.generate_response_stream(query, decision)
+
+# --- FAISS Loading Functions (giữ nguyên) ---
 @st.cache_resource
 def load_or_create_product_faiss(_embedder):
     """Tải hoặc tạo FAISS index cho dữ liệu sản phẩm."""
@@ -411,45 +412,47 @@ def get_agent_manager():
     return AgentManager()
 
 # --- STREAMLIT UI ---
-st.set_page_config(page_title="EKS Agent-to-Agent System", page_icon="🤖")
-st.title("🤖 EKS Agent-to-Agent AI System")
-st.caption("Hệ thống AI đa tác nhân với Router Agent và Task Agents chuyên biệt")
+st.set_page_config(page_title="EKS Agentic RAG System", page_icon="🤖")
+st.title("🤖 EKS Agentic RAG System")
+st.caption("Hệ thống AI Master Agent với RAG thông minh từ nhiều nguồn dữ liệu")
 
-# Sidebar thông tin agents
+# Sidebar thông tin hệ thống
 with st.sidebar:
-    st.header("🎯 System Agents")
-    st.write("**🧭 Router Agent**: Phân tích và điều phối")
-    st.write("**👨‍🔬 Product Specialist**: Chuyên gia sản phẩm")
-    st.write("**👨‍💼 General Consultant**: Tư vấn viên chung")
+    st.header("🎯 Agentic RAG System")
+    st.write("**🧠 Master Agent**: Đánh giá và quyết định nguồn thông tin")
+    st.write("**📚 Script Database**: Kịch bản Q&A có sẵn")
+    st.write("**🛍️ Product Database**: Chi tiết sản phẩm EKS")
     
     st.header("🔍 Debug Mode")
-    show_routing = st.checkbox("Hiển thị thông tin routing")
+    show_decision = st.checkbox("Hiển thị quyết định Master Agent")
+    show_sources = st.checkbox("Hiển thị nguồn thông tin")
 
 # Khởi tạo Agent Manager
 try:
     agent_manager = get_agent_manager()
-    st.success("✅ Agent system initialized successfully!")
+    st.success("✅ Agentic RAG system initialized successfully!")
 except Exception as e:
-    st.error(f"❌ Lỗi khởi tạo agent system: {e}")
+    st.error(f"❌ Lỗi khởi tạo agentic RAG system: {e}")
     st.stop()
 
 # Chat Interface
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {"role": "assistant", "content": """
-🎉 **Chào mừng đến với EKS Agent-to-Agent System!**
+🎉 **Chào mừng đến với EKS Agentic RAG System!**
 
-**Hệ thống có 3 AI Agents:**
-- 🧭 **Router Agent**: Phân tích câu hỏi và điều phối
-- 👨‍🔬 **Product Specialist**: Chuyên gia chi tiết về sản phẩm
-- 👨‍💼 **General Consultant**: Tư vấn viên cho câu hỏi chung
+**Hệ thống hoạt động như thế nào:**
+- 🧠 **Master Agent** truy vấn đồng thời cả database kịch bản và sản phẩm
+- 🎯 Tự động đánh giá và chọn nguồn thông tin tốt nhất
+- 📋 Ưu tiên câu trả lời từ kịch bản Q&A nếu phù hợp
+- 🔬 Bổ sung thông tin chi tiết từ database sản phẩm khi cần
 
-**Bạn có thể hỏi:**
-- Chi tiết về sản phẩm (thành phần, công dụng, cách dùng...)
-- So sánh sản phẩm, thông tin thương hiệu
-- Chính sách, dịch vụ, địa chỉ mua hàng
+**Bạn có thể hỏi bất kỳ điều gì về:**
+- Sản phẩm EKS (thành phần, công dụng, cách dùng...)
+- Chính sách, dịch vụ, hướng dẫn mua hàng
+- So sánh và tư vấn lựa chọn sản phẩm
 
-Hãy đặt câu hỏi để trải nghiệm hệ thống AI thông minh! 😊
+Hãy thử hỏi để trải nghiệm sức mạnh của Agentic RAG! 🚀
         """}
     ]
 
@@ -459,38 +462,61 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 # Chat input
-if prompt := st.chat_input("Hỏi EKS Agent System..."):
+if prompt := st.chat_input("Hỏi EKS Agentic RAG System..."):
     # Add user message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Process with Agent-to-Agent system
+    # Process with Agentic RAG system
     with st.chat_message("assistant"):
-        with st.spinner("🧭 Router Agent đang phân tích..."):
-            # 1. Get routing decision
+        with st.spinner("🧠 Master Agent đang phân tích và truy vấn dữ liệu..."):
+            # 1. Process query với Master Agent
             processing_result = agent_manager.process_query(prompt)
-            agent = processing_result['agent']
-            routing_info = processing_result['routing_info']
-            request = processing_result['request']
+            decision = processing_result['master_decision']
+            script_infos = processing_result['script_infos']
+            product_infos = processing_result['product_infos']
             
-            # 2. Show routing info if debug enabled
-            if show_routing:
-                with st.expander("🔍 Agent Routing Information"):
+            # 2. Show decision info if debug enabled
+            if show_decision:
+                with st.expander("🧠 Master Agent Decision"):
                     st.json({
-                        "selected_agent": routing_info['target_agent'],
-                        "confidence": routing_info['confidence'],
-                        "reasoning": routing_info['reasoning']
+                        "primary_source": decision.primary_source.value,
+                        "confidence": decision.confidence,
+                        "reasoning": decision.reasoning,
+                        "response_strategy": decision.response_strategy,
+                        "selected_info_count": len(decision.selected_info)
                     })
             
-            # 3. Display which agent is responding
-            agent_emoji = "👨‍🔬" if agent.agent_type == AgentType.PRODUCT_SPECIALIST else "👨‍💼"
-            agent_name = "Product Specialist" if agent.agent_type == AgentType.PRODUCT_SPECIALIST else "General Consultant"
+            # 3. Show sources if debug enabled
+            if show_sources:
+                col1, col2 = st.columns(2)
+                with col1:
+                    with st.expander("📚 Script Sources"):
+                        for i, info in enumerate(script_infos[:3]):
+                            st.write(f"**Score:** {info.score:.3f}")
+                            st.write(info.content[:200] + "..." if len(info.content) > 200 else info.content)
+                            st.divider()
+                
+                with col2:
+                    with st.expander("🛍️ Product Sources"):
+                        for i, info in enumerate(product_infos[:3]):
+                            st.write(f"**Score:** {info.score:.3f}")
+                            st.write(info.content[:200] + "..." if len(info.content) > 200 else info.content)
+                            st.divider()
             
-            st.write(f"{agent_emoji} **{agent_name} Agent** đang xử lý...")
+            # 4. Display Master Agent response strategy
+            strategy_emoji = {
+                SourceType.SCRIPT: "📚",
+                SourceType.PRODUCT: "🛍️", 
+                SourceType.HYBRID: "🔄"
+            }
             
-            # 4. Stream response from selected agent
-            response_generator = agent.process_stream(request)
+            emoji = strategy_emoji.get(decision.primary_source, "🤖")
+            st.write(f"{emoji} **Master Agent** (Strategy: {decision.primary_source.value}) đang trả lời...")
+            
+            # 5. Stream response from Master Agent
+            response_generator = agent_manager.get_response_stream(prompt, decision)
             full_response = st.write_stream(response_generator)
 
     # Add assistant response to history
