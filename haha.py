@@ -72,9 +72,6 @@ class BaseAgent:
             yield f"Xin lỗi, {self.name} gặp lỗi khi xử lý yêu cầu."
 
 # --- Router Agent ---
-# --- Router Agent (PHIÊN BẢN NÂNG CẤP) ---
-# --- Router Agent (PHIÊN BẢN TỔNG QUÁT) ---
-# --- Router Agent (PHIÊN BẢN CHỐNG LỖI FORMAT) ---
 class RouterAgent(BaseAgent):
     def __init__(self, model: genai.GenerativeModel):
         super().__init__(AgentType.ROUTER, model)
@@ -103,11 +100,11 @@ class RouterAgent(BaseAgent):
 
         **ĐẦU RA (CHỈ JSON):**
         ```json
-        {{
+        {
             "agent": "product_specialist" hoặc "general_consultant",
             "confidence": 1.0,
             "reasoning": "Lý do ngắn gọn dựa trên Gợi ý và Câu hỏi."
-        }}
+        }
         ```
         """
 
