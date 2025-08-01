@@ -100,11 +100,11 @@ class RouterAgent(BaseAgent):
 
         **ĐẦU RA (CHỈ JSON):**
         ```json
-        {
+        {{
             "agent": "product_specialist" hoặc "general_consultant",
             "confidence": 1.0,
             "reasoning": "Lý do ngắn gọn dựa trên Gợi ý và Câu hỏi."
-        }
+        }}
         ```
         """
 
@@ -117,6 +117,7 @@ class RouterAgent(BaseAgent):
             # Code vẫn giữ lại bước clean để phòng trường hợp hy hữu
             cleaned_text = response.text.strip().replace("```json", "").replace("```", "")
             routing_decision = json.loads(cleaned_text)
+            print(f"DEBUG: Router decision: {routing_decision}") 
 
             return {
                 'target_agent': routing_decision.get('agent', 'general_consultant'),
